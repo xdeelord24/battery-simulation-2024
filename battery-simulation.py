@@ -17,8 +17,12 @@ class BatterySimulator:
                  internal_resistance=0.01,  # ohms
                  cooling_coefficient=0.1,   # 1/hour
                  time_step=0.5,             # hours per simulation step
-                 human_behavior=True):      # whether to simulate human-like usage or not
-
+                 human_behavior=True,
+                 max_depth_of_discharge=80.0,  # % of full capacity that can be used (e.g., 80% means don't go below 20% SoC)
+                 max_temperature=40.0,          # °C, try not to exceed this temperature
+                 gentle_charge_rate_factor=0.5  # Reduce charge rate by this factor if conditions demand gentler charging
+                 ):
+        
         # Battery parameters
         self.initial_capacity = capacity_ah
         self.capacity = capacity_ah
@@ -38,7 +42,7 @@ class BatterySimulator:
         self.cycles = 0
         self.time = 0
 
-        # Temperature and thermal model parameters
+        # Thermal model parameters
         self.temperature = initial_temperature
         self.ambient_temperature = ambient_temperature
         self.thermal_mass = thermal_mass
@@ -47,6 +51,12 @@ class BatterySimulator:
 
         self.time_step = time_step
         self.human_behavior = human_behavior
+
+        # Additional best-practice parameters
+        self.max_depth_of_discharge = max_depth_of_discharge
+        self.min_soc = 100 - self.max_depth_of_discharge  # For 80% DoD, min SoC is 20%
+        self.max_temperature = max_temperature
+        self.gentle_charge_rate_factor = gentle_charge_rate_factor
 
         # Cycle tracking
         self.last_full_charge_reached = True
@@ -64,20 +74,35 @@ class BatterySimulator:
         return voltage
 
     def effective_charge_rate(self):
-        """Reduce charge rate near full capacity."""
+        """Calculate effective charge rate considering SoC, temperature, and gentle charge factor."""
+        # Base effective charge rate (reducing near full)
         if self.soc >= 80:
             reduction_factor = 1.0 - 0.9 * ((self.soc - 80) / 20)
-            return self.charge_rate * reduction_factor
+            base_rate = self.charge_rate * reduction_factor
         else:
-            return self.charge_rate
+            base_rate = self.charge_rate
+
+        # If temperature is high or we want gentler charging near high SoC, reduce further
+        if self.temperature > self.max_temperature or self.soc > 90:
+            base_rate *= self.gentle_charge_rate_factor
+
+        return base_rate
 
     def effective_discharge_rate(self):
-        """Reduce discharge rate near empty capacity."""
-        if self.soc <= 20:
-            reduction_factor = 1.0 - 0.9 * ((20 - self.soc) / 20)
-            return self.discharge_rate * reduction_factor
+        """Calculate effective discharge rate considering SoC and temperature limits."""
+        # Avoid going below min_soc for longevity
+        if self.soc <= self.min_soc:
+            # If near minimum SoC, drastically reduce discharge to prevent going below
+            reduction_factor = max(0.0, (self.soc - self.min_soc) / (20.0))  # a simple scale
+            base_rate = self.discharge_rate * reduction_factor
         else:
-            return self.discharge_rate
+            base_rate = self.discharge_rate
+
+        # If temperature is too high, reduce discharge to avoid further heating
+        if self.temperature > self.max_temperature:
+            base_rate *= 0.5
+
+        return base_rate
 
     def temperature_adjusted_efficiencies(self):
         """
@@ -99,7 +124,7 @@ class BatterySimulator:
         return charge_eff, discharge_eff, capacity_factor
 
     def charge(self, time_hours):
-        """Simulates battery charging."""
+        """Simulates battery charging respecting gentle charging under certain conditions."""
         eff_rate = self.effective_charge_rate()
         charge_eff, _, capacity_factor = self.temperature_adjusted_efficiencies()
 
@@ -116,21 +141,28 @@ class BatterySimulator:
             self.last_full_charge_reached = True
 
     def discharge(self, time_hours, discharge_rate_fraction=1.0):
-        """Simulates battery discharging with a certain fraction of the max discharge rate."""
+        """Simulates battery discharging within allowed DOD and temperature constraints."""
         eff_rate = self.effective_discharge_rate() * discharge_rate_fraction
+        if eff_rate < 0.01:
+            # Too low to effectively discharge due to constraints, just idle
+            self.idle(time_hours)
+            return
+
         _, discharge_eff, capacity_factor = self.temperature_adjusted_efficiencies()
 
         effective_capacity = self.capacity * capacity_factor
         energy_removed = eff_rate * time_hours / discharge_eff
         new_soc = self.soc - (energy_removed / effective_capacity * 100)
-        new_soc = max(new_soc, 0)
+        # Prevent going below the allowed minimum SoC
+        new_soc = max(new_soc, self.min_soc)
         self.update_soc(new_soc)
 
         # Heating effect from discharging
         self.heat_dissipation(charge_current=0, discharge_current=eff_rate, time_hours=time_hours)
 
-        # Full cycle detection
-        if self.soc == 0 and self.last_full_charge_reached:
+        # Full cycle detection (only if min_soc is effectively 0, else partial cycles)
+        # For partial cycles, you may define cycle counting differently.
+        if self.min_soc <= 0 and self.soc == 0 and self.last_full_charge_reached:
             self.cycles += 1
             self.last_full_charge_reached = False
             # Degrade capacity after full cycle
@@ -147,7 +179,7 @@ class BatterySimulator:
         """
         total_current = charge_current + discharge_current
 
-        # Compute I²R losses over the given time period:
+        # Compute I²R losses:
         # Power (W) = I²R; Energy (J) = Power * time(s)
         energy_lost_joules = (total_current**2 * self.internal_resistance) * (time_hours * 3600)
         
@@ -162,27 +194,26 @@ class BatterySimulator:
     def check_and_resync(self):
         """
         Checks if the battery SoC needs resynchronization based on voltage.
-        If the voltage is close to full voltage and SoC not at 100%, or close to min voltage and SoC not at 0%, resync.
         """
         current_voltage = self.get_voltage_from_soc(self.soc)
         expected_full_voltage = self.num_cells_series * self.v_max_cell
         expected_empty_voltage = self.num_cells_series * self.v_min_cell
 
-        # Tolerance for voltage matching full or empty condition
         tolerance = 0.01
 
         # If at or near full voltage but SOC isn't 100%, resync
         if abs(current_voltage - expected_full_voltage) < tolerance and self.soc < 99.9:
             self.soc = 100.0
 
-        # If at or near empty voltage but SOC isn't 0%, resync
-        if abs(current_voltage - expected_empty_voltage) < tolerance and self.soc > 0.1:
+        # If at or near empty voltage but SOC isn't min_soc, resync
+        # (Only if min_soc == 0, otherwise min_soc is your chosen lower limit)
+        if self.min_soc == 0 and abs(current_voltage - expected_empty_voltage) < tolerance and self.soc > 0.1:
             self.soc = 0.0
 
     def update_soc(self, new_soc):
         """Updates SOC, time, and logs the state."""
-        self.soc = max(min(new_soc, 100), 0)
-        self.check_and_resync()  # Check if we need to resync SOC
+        self.soc = max(min(new_soc, 100), self.min_soc)
+        self.check_and_resync()
         self.time += 1
         self.log_state()
 
@@ -206,7 +237,7 @@ class BatterySimulator:
         - Day: If human_behavior=True, random usage events (discharges).
                If human_behavior=False, simple continuous discharge pattern.
         """
-        # Night Charging: 
+        # Night Charging:
         steps = int(night_charge_hours / self.time_step)
         for _ in range(steps):
             self.charge(self.time_step)
@@ -267,7 +298,11 @@ class BatterySimulator:
         """
         Simulate multiple days of usage.
         If human_behavior=True, usage pattern is randomized events.
-        If human_behavior=False, usage pattern is a simple continuous discharge.
+        If human_behavior=False, usage pattern is simple continuous discharge.
+
+        The code now also implements best practices:
+        - Limited DoD (min_soc) to reduce stress
+        - Lower charge and discharge rates at high temp or high SoC
         """
         for day in range(days):
             self.simulate_day(night_charge_hours=8, 
@@ -300,14 +335,14 @@ class BatterySimulator:
         axs[3].set_xlabel('Time Steps')
         axs[3].grid(True)
 
-        plt.suptitle('Battery Usage Over Multiple Days')
+        plt.suptitle('Battery Usage With Best-Practice Constraints')
         plt.tight_layout()
         plt.show()
 
 
 # Example usage:
 if __name__ == "__main__":
-    # Run with human-like usage and automatic resync feature
+    # Human-like usage with additional best practice constraints
     battery_human = BatterySimulator(
         capacity_ah=100,
         charge_rate_a=10,
@@ -322,27 +357,33 @@ if __name__ == "__main__":
         internal_resistance=0.01,
         cooling_coefficient=0.1,
         time_step=0.5,
-        human_behavior=True
+        human_behavior=True,
+        max_depth_of_discharge=80.0,
+        max_temperature=40.0,
+        gentle_charge_rate_factor=0.5
     )
     battery_human.simulate(days=10)
     battery_human.plot_results()
 
-    # # Run without human-like usage (steady load) and automatic resync
-    # battery_simple = BatterySimulator(
-    #     capacity_ah=100,
-    #     charge_rate_a=10,
-    #     discharge_rate_a=10,
-    #     charge_efficiency=0.95,
-    #     discharge_efficiency=0.95,
-    #     degradation_rate=0.0005,
-    #     num_cells_series=13,
-    #     initial_temperature=25.0,
-    #     ambient_temperature=25.0,
-    #     thermal_mass=5000.0,
-    #     internal_resistance=0.01,
-    #     cooling_coefficient=0.1,
-    #     time_step=0.5,
-    #     human_behavior=False
-    # )
-    # battery_simple.simulate(days=10)
-    # battery_simple.plot_results()
+    # Non-human usage scenario with best practice constraints
+    battery_simple = BatterySimulator(
+        capacity_ah=100,
+        charge_rate_a=10,
+        discharge_rate_a=10,
+        charge_efficiency=0.95,
+        discharge_efficiency=0.95,
+        degradation_rate=0.0005,
+        num_cells_series=13,
+        initial_temperature=25.0,
+        ambient_temperature=25.0,
+        thermal_mass=5000.0,
+        internal_resistance=0.01,
+        cooling_coefficient=0.1,
+        time_step=0.5,
+        human_behavior=False,
+        max_depth_of_discharge=80.0,
+        max_temperature=40.0,
+        gentle_charge_rate_factor=0.5
+    )
+    battery_simple.simulate(days=10)
+    battery_simple.plot_results()
