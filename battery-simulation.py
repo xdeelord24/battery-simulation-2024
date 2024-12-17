@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 import numpy as np
+import random
 
 class BatterySimulator:
     def __init__(self, 
@@ -10,25 +11,10 @@ class BatterySimulator:
                  discharge_efficiency=0.95, 
                  degradation_rate=0.0001, 
                  num_cells_series=13,
-                 initial_temperature=25.0,      # Starting temperature in °C
-                 ambient_temperature=25.0,      # Ambient temperature in °C
-                 thermal_cooling_rate=0.1,      # How quickly battery cools per time step towards ambient (°C per step)
-                 thermal_heating_factor=0.05):  # How much temperature rises per A of current * hours
-        """
-        Initialize the battery simulator.
-
-        :param capacity_ah: Initial battery capacity in Ah.
-        :param charge_rate_a: Max charging rate (A).
-        :param discharge_rate_a: Max discharging rate (A).
-        :param charge_efficiency: Charge efficiency (0-1).
-        :param discharge_efficiency: Discharge efficiency (0-1).
-        :param degradation_rate: Rate of capacity degradation per full cycle.
-        :param num_cells_series: Number of cells in series.
-        :param initial_temperature: Initial temperature of the battery in °C.
-        :param ambient_temperature: Ambient environmental temperature in °C.
-        :param thermal_cooling_rate: Cooling rate towards ambient per time step.
-        :param thermal_heating_factor: Factor for temperature rise due to current flow.
-        """
+                 initial_temperature=25.0,
+                 ambient_temperature=25.0,
+                 thermal_cooling_rate=0.1,
+                 thermal_heating_factor=0.05):
 
         # Battery parameters
         self.initial_capacity = capacity_ah
@@ -71,9 +57,7 @@ class BatterySimulator:
         return voltage
 
     def effective_charge_rate(self):
-        """
-        Reduce charge rate near full capacity.
-        """
+        """Reduce charge rate near full capacity."""
         if self.soc >= 80:
             reduction_factor = 1.0 - 0.9 * ((self.soc - 80) / 20)
             return self.charge_rate * reduction_factor
@@ -81,9 +65,7 @@ class BatterySimulator:
             return self.charge_rate
 
     def effective_discharge_rate(self):
-        """
-        Reduce discharge rate near empty capacity.
-        """
+        """Reduce discharge rate near empty capacity."""
         if self.soc <= 20:
             reduction_factor = 1.0 - 0.9 * ((20 - self.soc) / 20)
             return self.discharge_rate * reduction_factor
@@ -92,27 +74,17 @@ class BatterySimulator:
 
     def temperature_adjusted_efficiencies(self):
         """
-        Adjust charge and discharge efficiencies based on temperature.
-        As a simplistic model:
-        - At low temperatures (<10°C), efficiency decreases by up to 10%.
-        - At high temperatures (>40°C), efficiency also decreases by up to 10%.
-        Between 10°C and 40°C, the nominal efficiency is retained.
-
-        Similarly, capacity can be affected by temperature:
-        - At low temperature (<10°C), reduce usable capacity by 5%.
-        - At high temperature (>40°C), reduce usable capacity by 5%.
+        Adjust charge/discharge efficiencies and capacity based on temperature.
         """
         charge_eff = self.charge_eff_base
         discharge_eff = self.discharge_eff_base
         capacity_factor = 1.0
 
         if self.temperature < 10:
-            # Cold reduces efficiency and capacity
             charge_eff *= 0.9
             discharge_eff *= 0.9
             capacity_factor = 0.95
         elif self.temperature > 40:
-            # Hot reduces efficiency and capacity
             charge_eff *= 0.9
             discharge_eff *= 0.9
             capacity_factor = 0.95
@@ -138,9 +110,9 @@ class BatterySimulator:
         if self.soc == 100:
             self.last_full_charge_reached = True
 
-    def discharge(self, time_hours):
-        """Simulates battery discharging."""
-        eff_rate = self.effective_discharge_rate()
+    def discharge(self, time_hours, discharge_rate_fraction=1.0):
+        """Simulates battery discharging with a certain fraction of the max discharge rate."""
+        eff_rate = self.effective_discharge_rate() * discharge_rate_fraction
         _, discharge_eff, capacity_factor = self.temperature_adjusted_efficiencies()
 
         # Adjust the effective capacity based on temperature
@@ -166,32 +138,25 @@ class BatterySimulator:
 
     def heat_dissipation(self, charge_current, discharge_current, time_hours):
         """
-        A simple temperature model:
-        - Heat generated is proportional to current * time.
-        - Battery then cools towards ambient at a fixed rate.
+        Very simplified thermal model.
         """
-        # Heating proportional to total current flow
         total_current = charge_current + discharge_current
         heat_generated = self.thermal_heating_factor * total_current * time_hours
         self.temperature += heat_generated
 
-        # Cooling towards ambient
-        # The closer the battery is to ambient, the less it cools.
+        # Move temperature towards ambient
         temp_diff = self.temperature - self.ambient_temperature
         if abs(temp_diff) > 0.01:
-            # Move temperature a fraction closer to ambient
             self.temperature -= np.sign(temp_diff) * min(abs(temp_diff), self.thermal_cooling_rate)
 
     def update_soc(self, new_soc):
-        """
-        Updates SOC, time, and logs the state.
-        """
+        """Updates SOC, time, and logs the state."""
         self.soc = max(min(new_soc, 100), 0)
         self.time += 1
         self.log_state()
 
     def log_state(self):
-        """Logs current state to history."""
+        """Logs current state."""
         self.history['time'].append(self.time)
         self.history['SoC'].append(self.soc)
         self.history['Capacity'].append(self.capacity)
@@ -199,13 +164,92 @@ class BatterySimulator:
         self.history['Voltage'].append(self.get_voltage_from_soc(self.soc))
         self.history['Temperature'].append(self.temperature)
 
-    def simulate(self, steps, charge_time=1.0, discharge_time=1.0):
+    def simulate_day(self, 
+                     night_charge_hours=8.0, 
+                     day_hours=16.0, 
+                     usage_events=5, 
+                     max_usage_duration=1.0):
         """
-        Simulates charge/discharge steps.
+        Simulate one "day":
+        - Night: charge for `night_charge_hours` at a steady rate.
+        - Day: random usage events (discharges) scattered throughout `day_hours`.
+
+        :param night_charge_hours: Hours of continuous charging at night.
+        :param day_hours: Total daytime hours available for usage events.
+        :param usage_events: Number of random usage events (discharge periods).
+        :param max_usage_duration: Maximum length (hours) of a single usage event.
         """
+        # Night Charging: Long, steady charge
+        # Charge in increments of 0.5 hours to simulate time steps
+        charge_step = 0.5
+        steps = int(night_charge_hours / charge_step)
         for _ in range(steps):
-            self.charge(charge_time)
-            self.discharge(discharge_time)
+            self.charge(charge_step)
+
+        # Daytime usage:
+        # We have a total of `day_hours` to place `usage_events`.
+        # We'll generate random start times and durations for each event.
+        # Sort them by start time to simulate a sequence.
+
+        events = []
+        for _ in range(usage_events):
+            event_start = random.uniform(0, day_hours - 0.1)
+            event_duration = random.uniform(0.1, max_usage_duration)
+            # Each event has a start and duration
+            events.append((event_start, event_duration))
+
+        # Sort events by start time
+        events.sort(key=lambda x: x[0])
+
+        current_time = 0.0
+        timestep = 0.5  # half-hour increments for simulation
+
+        for event_start, event_duration in events:
+            # Idle until event_start
+            while current_time < event_start:
+                # No charging or discharging, just time passing
+                self.idle(timestep)
+                current_time += timestep
+
+            # Event (discharge)
+            event_end = event_start + event_duration
+            while current_time < event_end:
+                # Discharge at some fraction of the discharge rate
+                # Let's assume random usage intensity: 30% to 100% of max discharge
+                discharge_fraction = random.uniform(0.3, 1.0)
+                self.discharge(timestep, discharge_rate_fraction=discharge_fraction)
+                current_time += timestep
+
+        # After last event, if any time remains in the day, remain idle
+        while current_time < day_hours:
+            self.idle(timestep)
+            current_time += timestep
+
+    def idle(self, time_hours):
+        """Simulate idle time (no charging or discharging)."""
+        # Just let temperature approach ambient
+        self.heat_dissipation(charge_current=0, discharge_current=0, time_hours=time_hours)
+        # Advance time steps
+        steps = int(time_hours / 0.5)
+        for _ in range(steps):
+            # Logging at each half-hour for consistency
+            self.time += 1
+            self.log_state()
+
+    def simulate(self, days=10):
+        """
+        Simulate multiple days of human-like usage:
+        Each day:
+          - 8 hours night charge
+          - 16 hours day usage with random events
+
+        :param days: Number of days to simulate.
+        """
+        for day in range(days):
+            self.simulate_day(night_charge_hours=8, 
+                              day_hours=16, 
+                              usage_events=random.randint(3,7), 
+                              max_usage_duration=2.0)
 
     def plot_results(self):
         """Plot SoC, Capacity, Voltage, and Temperature."""
@@ -228,17 +272,18 @@ class BatterySimulator:
 
         # Temperature
         axs[3].plot(self.history['time'], self.history['Temperature'], color='tab:orange')
-        axs[3].set_ylabel('Temperature (°C)')
+        axs[3].set_ylabel('Temp (°C)')
         axs[3].set_xlabel('Time Steps')
         axs[3].grid(True)
 
-        plt.suptitle('Battery Simulation (SoC, Capacity, Voltage, Temperature)')
+        plt.suptitle('Human-like Battery Usage Over Multiple Days')
         plt.tight_layout()
         plt.show()
 
 
 # Example usage:
 if __name__ == "__main__":
+    # Create a battery simulator and run for 10 days
     battery = BatterySimulator(
         capacity_ah=100,
         charge_rate_a=10,
@@ -249,10 +294,12 @@ if __name__ == "__main__":
         num_cells_series=13,
         initial_temperature=25.0,
         ambient_temperature=25.0,
-        thermal_cooling_rate=0.05,    # slower cooling
-        thermal_heating_factor=0.1    # more heat per current flow
+        thermal_cooling_rate=0.05,
+        thermal_heating_factor=0.05
     )
 
-    # Simulate 100 steps with 0.5h charge and 0.5h discharge
-    battery.simulate(steps=100, charge_time=0.5, discharge_time=0.5)
+    # Simulate 10 days of human-like usage
+    battery.simulate(days=10)
+
+    # Plot the results
     battery.plot_results()
