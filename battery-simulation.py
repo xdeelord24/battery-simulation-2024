@@ -13,12 +13,11 @@ class BatterySimulator:
                  num_cells_series=13,
                  initial_temperature=25.0,
                  ambient_temperature=25.0,
-                 # Removed old thermal parameters in favor of a more physical model:
                  thermal_mass=5000.0,    # Joules/°C, thermal mass of the battery
                  internal_resistance=0.01,  # ohms, internal resistance for heat generation
                  cooling_coefficient=0.1,   # 1/hour, Newtonian cooling coefficient
-                 time_step=0.5):  # hours per simulation step
-
+                 time_step=0.5,             # hours per simulation step
+                 human_behavior=True):      # whether to simulate human-like usage or not
         # Battery parameters
         self.initial_capacity = capacity_ah
         self.capacity = capacity_ah
@@ -46,6 +45,7 @@ class BatterySimulator:
         self.cooling_coefficient = cooling_coefficient
 
         self.time_step = time_step
+        self.human_behavior = human_behavior
 
         # Cycle tracking
         self.last_full_charge_reached = True
@@ -182,49 +182,57 @@ class BatterySimulator:
         """
         Simulate one "day":
         - Night: charge for `night_charge_hours` at a steady rate.
-        - Day: random usage events (discharges) scattered throughout `day_hours`.
+        - Day: If human_behavior=True, random usage events (discharges).
+               If human_behavior=False, simple continuous discharge pattern.
         """
         # Night Charging: 
         steps = int(night_charge_hours / self.time_step)
         for _ in range(steps):
             self.charge(self.time_step)
 
-        # Daytime usage:
-        events = []
-        for _ in range(usage_events):
-            event_start = random.uniform(0, day_hours - 0.1)
-            event_duration = random.uniform(0.1, max_usage_duration)
-            events.append((event_start, event_duration))
+        if self.human_behavior:
+            # Daytime usage with random events
+            events = []
+            for _ in range(usage_events):
+                event_start = random.uniform(0, day_hours - 0.1)
+                event_duration = random.uniform(0.1, max_usage_duration)
+                events.append((event_start, event_duration))
 
-        # Sort events by start time
-        events.sort(key=lambda x: x[0])
+            # Sort events by start time
+            events.sort(key=lambda x: x[0])
 
-        current_time = 0.0
-        while events:
-            event_start, event_duration = events.pop(0)
+            current_time = 0.0
+            while events:
+                event_start, event_duration = events.pop(0)
 
-            # Idle until event_start
-            while current_time < event_start:
-                self.idle(min(self.time_step, event_start - current_time))
+                # Idle until event_start
+                while current_time < event_start:
+                    self.idle(min(self.time_step, event_start - current_time))
+                    current_time += self.time_step
+
+                # Event (discharge)
+                event_end = event_start + event_duration
+                while current_time < event_end:
+                    discharge_fraction = random.uniform(0.3, 1.0)
+                    self.discharge(self.time_step, discharge_rate_fraction=discharge_fraction)
+                    current_time += self.time_step
+
+            # After last event, if any time remains in the day, remain idle
+            while current_time < day_hours:
+                self.idle(min(self.time_step, day_hours - current_time))
                 current_time += self.time_step
-
-            # Event (discharge)
-            event_end = event_start + event_duration
-            while current_time < event_end:
-                discharge_fraction = random.uniform(0.3, 1.0)
-                self.discharge(self.time_step, discharge_rate_fraction=discharge_fraction)
+        else:
+            # If not human behavior, just continuously discharge over the day at a constant rate
+            # For example, half of the max discharge rate throughout the entire day:
+            current_time = 0.0
+            steps = int(day_hours / self.time_step)
+            for _ in range(steps):
+                self.discharge(self.time_step, discharge_rate_fraction=0.5)
                 current_time += self.time_step
-
-        # After last event, if any time remains in the day, remain idle
-        while current_time < day_hours:
-            self.idle(min(self.time_step, day_hours - current_time))
-            current_time += self.time_step
 
     def idle(self, time_hours):
         """Simulate idle time (no charging or discharging)."""
         # Even when idle, run thermal model (just cooling)
-        # When no current: no added heat, just cooling step.
-        # But for consistency, let's apply a small step for temperature each time_step.
         steps = int(time_hours / self.time_step)
         remainder = time_hours - steps * self.time_step
         for _ in range(steps):
@@ -238,10 +246,9 @@ class BatterySimulator:
 
     def simulate(self, days=10):
         """
-        Simulate multiple days of human-like usage.
-        Each day:
-          - 8 hours night charge
-          - 16 hours day usage with random events
+        Simulate multiple days of usage.
+        If human_behavior=True, usage pattern is randomized events (more human-like).
+        If human_behavior=False, usage pattern is a simple continuous discharge.
         """
         for day in range(days):
             self.simulate_day(night_charge_hours=8, 
@@ -274,14 +281,15 @@ class BatterySimulator:
         axs[3].set_xlabel('Time Steps')
         axs[3].grid(True)
 
-        plt.suptitle('Human-like Battery Usage Over Multiple Days')
+        plt.suptitle('Battery Usage Over Multiple Days')
         plt.tight_layout()
         plt.show()
 
 
 # Example usage:
 if __name__ == "__main__":
-    battery = BatterySimulator(
+    # Run with human-like usage
+    battery_human = BatterySimulator(
         capacity_ah=100,
         charge_rate_a=10,
         discharge_rate_a=10,
@@ -294,11 +302,28 @@ if __name__ == "__main__":
         thermal_mass=5000.0,       # Joules/°C
         internal_resistance=0.01,  # Ohms
         cooling_coefficient=0.1,   # 1/hour
-        time_step=0.5              # hours per step
+        time_step=0.5,
+        human_behavior=True
     )
+    battery_human.simulate(days=10)
+    battery_human.plot_results()
 
-    # Simulate 10 days of human-like usage
-    battery.simulate(days=10)
-
-    # Plot the results
-    battery.plot_results()
+    # Run without human-like usage (steady load)
+    # battery_simple = BatterySimulator(
+    #     capacity_ah=100,
+    #     charge_rate_a=10,
+    #     discharge_rate_a=10,
+    #     charge_efficiency=0.95,
+    #     discharge_efficiency=0.95,
+    #     degradation_rate=0.0005,
+    #     num_cells_series=13,
+    #     initial_temperature=25.0,
+    #     ambient_temperature=25.0,
+    #     thermal_mass=5000.0,
+    #     internal_resistance=0.01,
+    #     cooling_coefficient=0.1,
+    #     time_step=0.5,
+    #     human_behavior=False
+    # )
+    # battery_simple.simulate(days=10)
+    # battery_simple.plot_results()
