@@ -13,11 +13,12 @@ class BatterySimulator:
                  num_cells_series=13,
                  initial_temperature=25.0,
                  ambient_temperature=25.0,
-                 thermal_mass=5000.0,    # Joules/°C, thermal mass of the battery
-                 internal_resistance=0.01,  # ohms, internal resistance for heat generation
-                 cooling_coefficient=0.1,   # 1/hour, Newtonian cooling coefficient
+                 thermal_mass=5000.0,    # Joules/°C
+                 internal_resistance=0.01,  # ohms
+                 cooling_coefficient=0.1,   # 1/hour
                  time_step=0.5,             # hours per simulation step
                  human_behavior=True):      # whether to simulate human-like usage or not
+
         # Battery parameters
         self.initial_capacity = capacity_ah
         self.capacity = capacity_ah
@@ -156,12 +157,32 @@ class BatterySimulator:
 
         # Apply Newtonian cooling
         temp_diff = self.temperature - self.ambient_temperature
-        # dT = -k * (T - Tamb) * time_hours
         self.temperature -= self.cooling_coefficient * temp_diff * time_hours
+
+    def check_and_resync(self):
+        """
+        Checks if the battery SoC needs resynchronization based on voltage.
+        If the voltage is close to full voltage and SoC not at 100%, or close to min voltage and SoC not at 0%, resync.
+        """
+        current_voltage = self.get_voltage_from_soc(self.soc)
+        expected_full_voltage = self.num_cells_series * self.v_max_cell
+        expected_empty_voltage = self.num_cells_series * self.v_min_cell
+
+        # Tolerance for voltage matching full or empty condition
+        tolerance = 0.01
+
+        # If at or near full voltage but SOC isn't 100%, resync
+        if abs(current_voltage - expected_full_voltage) < tolerance and self.soc < 99.9:
+            self.soc = 100.0
+
+        # If at or near empty voltage but SOC isn't 0%, resync
+        if abs(current_voltage - expected_empty_voltage) < tolerance and self.soc > 0.1:
+            self.soc = 0.0
 
     def update_soc(self, new_soc):
         """Updates SOC, time, and logs the state."""
         self.soc = max(min(new_soc, 100), 0)
+        self.check_and_resync()  # Check if we need to resync SOC
         self.time += 1
         self.log_state()
 
@@ -223,7 +244,6 @@ class BatterySimulator:
                 current_time += self.time_step
         else:
             # If not human behavior, just continuously discharge over the day at a constant rate
-            # For example, half of the max discharge rate throughout the entire day:
             current_time = 0.0
             steps = int(day_hours / self.time_step)
             for _ in range(steps):
@@ -232,7 +252,6 @@ class BatterySimulator:
 
     def idle(self, time_hours):
         """Simulate idle time (no charging or discharging)."""
-        # Even when idle, run thermal model (just cooling)
         steps = int(time_hours / self.time_step)
         remainder = time_hours - steps * self.time_step
         for _ in range(steps):
@@ -247,7 +266,7 @@ class BatterySimulator:
     def simulate(self, days=10):
         """
         Simulate multiple days of usage.
-        If human_behavior=True, usage pattern is randomized events (more human-like).
+        If human_behavior=True, usage pattern is randomized events.
         If human_behavior=False, usage pattern is a simple continuous discharge.
         """
         for day in range(days):
@@ -288,7 +307,7 @@ class BatterySimulator:
 
 # Example usage:
 if __name__ == "__main__":
-    # Run with human-like usage
+    # Run with human-like usage and automatic resync feature
     battery_human = BatterySimulator(
         capacity_ah=100,
         charge_rate_a=10,
@@ -299,16 +318,16 @@ if __name__ == "__main__":
         num_cells_series=13,
         initial_temperature=25.0,
         ambient_temperature=25.0,
-        thermal_mass=5000.0,       # Joules/°C
-        internal_resistance=0.01,  # Ohms
-        cooling_coefficient=0.1,   # 1/hour
+        thermal_mass=5000.0,
+        internal_resistance=0.01,
+        cooling_coefficient=0.1,
         time_step=0.5,
         human_behavior=True
     )
     battery_human.simulate(days=10)
     battery_human.plot_results()
 
-    # Run without human-like usage (steady load)
+    # # Run without human-like usage (steady load) and automatic resync
     # battery_simple = BatterySimulator(
     #     capacity_ah=100,
     #     charge_rate_a=10,
