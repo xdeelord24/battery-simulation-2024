@@ -1,5 +1,7 @@
 **Human-Like Battery Usage Simulator**
 
+![image](https://github.com/user-attachments/assets/07e19819-56e6-4fe1-9087-71493199e749)
+
 This repository contains a Python-based simulation of a battery undergoing realistic "human-like" usage patterns over multiple days. The simulation models daily charging cycles (nighttime charging) and various random discharge events (daytime usage), reflecting how a real user might interact with an energy storage device, such as an electric vehicle battery or a home energy system.
 
 **Key Features:**
