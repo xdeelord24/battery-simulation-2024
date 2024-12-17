@@ -13,8 +13,11 @@ class BatterySimulator:
                  num_cells_series=13,
                  initial_temperature=25.0,
                  ambient_temperature=25.0,
-                 thermal_cooling_rate=0.1,
-                 thermal_heating_factor=0.05):
+                 # Removed old thermal parameters in favor of a more physical model:
+                 thermal_mass=5000.0,    # Joules/°C, thermal mass of the battery
+                 internal_resistance=0.01,  # ohms, internal resistance for heat generation
+                 cooling_coefficient=0.1,   # 1/hour, Newtonian cooling coefficient
+                 time_step=0.5):  # hours per simulation step
 
         # Battery parameters
         self.initial_capacity = capacity_ah
@@ -35,11 +38,14 @@ class BatterySimulator:
         self.cycles = 0
         self.time = 0
 
-        # Temperature parameters
+        # Temperature and thermal model parameters
         self.temperature = initial_temperature
         self.ambient_temperature = ambient_temperature
-        self.thermal_cooling_rate = thermal_cooling_rate
-        self.thermal_heating_factor = thermal_heating_factor
+        self.thermal_mass = thermal_mass
+        self.internal_resistance = internal_resistance
+        self.cooling_coefficient = cooling_coefficient
+
+        self.time_step = time_step
 
         # Cycle tracking
         self.last_full_charge_reached = True
@@ -96,9 +102,7 @@ class BatterySimulator:
         eff_rate = self.effective_charge_rate()
         charge_eff, _, capacity_factor = self.temperature_adjusted_efficiencies()
 
-        # Adjust the effective capacity based on temperature
         effective_capacity = self.capacity * capacity_factor
-
         energy_added = eff_rate * time_hours * charge_eff
         new_soc = self.soc + (energy_added / effective_capacity * 100)
         new_soc = min(new_soc, 100)
@@ -115,13 +119,10 @@ class BatterySimulator:
         eff_rate = self.effective_discharge_rate() * discharge_rate_fraction
         _, discharge_eff, capacity_factor = self.temperature_adjusted_efficiencies()
 
-        # Adjust the effective capacity based on temperature
         effective_capacity = self.capacity * capacity_factor
-
         energy_removed = eff_rate * time_hours / discharge_eff
         new_soc = self.soc - (energy_removed / effective_capacity * 100)
         new_soc = max(new_soc, 0)
-        old_soc = self.soc
         self.update_soc(new_soc)
 
         # Heating effect from discharging
@@ -138,16 +139,25 @@ class BatterySimulator:
 
     def heat_dissipation(self, charge_current, discharge_current, time_hours):
         """
-        Very simplified thermal model.
+        Improved thermal model:
+        - Compute heat from I²R losses
+        - Use thermal mass to determine temperature rise
+        - Apply Newtonian cooling to ambient
         """
         total_current = charge_current + discharge_current
-        heat_generated = self.thermal_heating_factor * total_current * time_hours
-        self.temperature += heat_generated
 
-        # Move temperature towards ambient
+        # Compute I²R losses over the given time period:
+        # Power (W) = I²R; Energy (J) = Power * time(s)
+        energy_lost_joules = (total_current**2 * self.internal_resistance) * (time_hours * 3600)
+        
+        # Convert energy to temperature rise based on thermal mass
+        delta_temp = energy_lost_joules / self.thermal_mass
+        self.temperature += delta_temp
+
+        # Apply Newtonian cooling
         temp_diff = self.temperature - self.ambient_temperature
-        if abs(temp_diff) > 0.01:
-            self.temperature -= np.sign(temp_diff) * min(abs(temp_diff), self.thermal_cooling_rate)
+        # dT = -k * (T - Tamb) * time_hours
+        self.temperature -= self.cooling_coefficient * temp_diff * time_hours
 
     def update_soc(self, new_soc):
         """Updates SOC, time, and logs the state."""
@@ -173,77 +183,65 @@ class BatterySimulator:
         Simulate one "day":
         - Night: charge for `night_charge_hours` at a steady rate.
         - Day: random usage events (discharges) scattered throughout `day_hours`.
-
-        :param night_charge_hours: Hours of continuous charging at night.
-        :param day_hours: Total daytime hours available for usage events.
-        :param usage_events: Number of random usage events (discharge periods).
-        :param max_usage_duration: Maximum length (hours) of a single usage event.
         """
-        # Night Charging: Long, steady charge
-        # Charge in increments of 0.5 hours to simulate time steps
-        charge_step = 0.5
-        steps = int(night_charge_hours / charge_step)
+        # Night Charging: 
+        steps = int(night_charge_hours / self.time_step)
         for _ in range(steps):
-            self.charge(charge_step)
+            self.charge(self.time_step)
 
         # Daytime usage:
-        # We have a total of `day_hours` to place `usage_events`.
-        # We'll generate random start times and durations for each event.
-        # Sort them by start time to simulate a sequence.
-
         events = []
         for _ in range(usage_events):
             event_start = random.uniform(0, day_hours - 0.1)
             event_duration = random.uniform(0.1, max_usage_duration)
-            # Each event has a start and duration
             events.append((event_start, event_duration))
 
         # Sort events by start time
         events.sort(key=lambda x: x[0])
 
         current_time = 0.0
-        timestep = 0.5  # half-hour increments for simulation
+        while events:
+            event_start, event_duration = events.pop(0)
 
-        for event_start, event_duration in events:
             # Idle until event_start
             while current_time < event_start:
-                # No charging or discharging, just time passing
-                self.idle(timestep)
-                current_time += timestep
+                self.idle(min(self.time_step, event_start - current_time))
+                current_time += self.time_step
 
             # Event (discharge)
             event_end = event_start + event_duration
             while current_time < event_end:
-                # Discharge at some fraction of the discharge rate
-                # Let's assume random usage intensity: 30% to 100% of max discharge
                 discharge_fraction = random.uniform(0.3, 1.0)
-                self.discharge(timestep, discharge_rate_fraction=discharge_fraction)
-                current_time += timestep
+                self.discharge(self.time_step, discharge_rate_fraction=discharge_fraction)
+                current_time += self.time_step
 
         # After last event, if any time remains in the day, remain idle
         while current_time < day_hours:
-            self.idle(timestep)
-            current_time += timestep
+            self.idle(min(self.time_step, day_hours - current_time))
+            current_time += self.time_step
 
     def idle(self, time_hours):
         """Simulate idle time (no charging or discharging)."""
-        # Just let temperature approach ambient
-        self.heat_dissipation(charge_current=0, discharge_current=0, time_hours=time_hours)
-        # Advance time steps
-        steps = int(time_hours / 0.5)
+        # Even when idle, run thermal model (just cooling)
+        # When no current: no added heat, just cooling step.
+        # But for consistency, let's apply a small step for temperature each time_step.
+        steps = int(time_hours / self.time_step)
+        remainder = time_hours - steps * self.time_step
         for _ in range(steps):
-            # Logging at each half-hour for consistency
+            self.heat_dissipation(charge_current=0, discharge_current=0, time_hours=self.time_step)
+            self.time += 1
+            self.log_state()
+        if remainder > 0:
+            self.heat_dissipation(charge_current=0, discharge_current=0, time_hours=remainder)
             self.time += 1
             self.log_state()
 
     def simulate(self, days=10):
         """
-        Simulate multiple days of human-like usage:
+        Simulate multiple days of human-like usage.
         Each day:
           - 8 hours night charge
           - 16 hours day usage with random events
-
-        :param days: Number of days to simulate.
         """
         for day in range(days):
             self.simulate_day(night_charge_hours=8, 
@@ -283,7 +281,6 @@ class BatterySimulator:
 
 # Example usage:
 if __name__ == "__main__":
-    # Create a battery simulator and run for 10 days
     battery = BatterySimulator(
         capacity_ah=100,
         charge_rate_a=10,
@@ -294,8 +291,10 @@ if __name__ == "__main__":
         num_cells_series=13,
         initial_temperature=25.0,
         ambient_temperature=25.0,
-        thermal_cooling_rate=0.05,
-        thermal_heating_factor=0.05
+        thermal_mass=5000.0,       # Joules/°C
+        internal_resistance=0.01,  # Ohms
+        cooling_coefficient=0.1,   # 1/hour
+        time_step=0.5              # hours per step
     )
 
     # Simulate 10 days of human-like usage
