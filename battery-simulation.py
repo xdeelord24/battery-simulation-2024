@@ -9,75 +9,70 @@ class BatterySimulator:
                  charge_efficiency=0.95, 
                  discharge_efficiency=0.95, 
                  degradation_rate=0.0001, 
-                 num_cells_series=13):
+                 num_cells_series=13,
+                 initial_temperature=25.0,      # Starting temperature in °C
+                 ambient_temperature=25.0,      # Ambient temperature in °C
+                 thermal_cooling_rate=0.1,      # How quickly battery cools per time step towards ambient (°C per step)
+                 thermal_heating_factor=0.05):  # How much temperature rises per A of current * hours
         """
         Initialize the battery simulator.
 
         :param capacity_ah: Initial battery capacity in Ah.
-        :param charge_rate_a: Charging rate in A (nominal).
-        :param discharge_rate_a: Discharge rate in A (nominal).
+        :param charge_rate_a: Max charging rate (A).
+        :param discharge_rate_a: Max discharging rate (A).
         :param charge_efficiency: Charge efficiency (0-1).
         :param discharge_efficiency: Discharge efficiency (0-1).
         :param degradation_rate: Rate of capacity degradation per full cycle.
-        :param num_cells_series: Number of Li-ion cells in series.
-        
-        For a Li-ion cell:
-        Full charge voltage ~4.2 V, fully discharged ~3.0 V.
-        For num_cells_series=13, pack voltage ~54.6 V (full) to ~39.0 V (empty).
+        :param num_cells_series: Number of cells in series.
+        :param initial_temperature: Initial temperature of the battery in °C.
+        :param ambient_temperature: Ambient environmental temperature in °C.
+        :param thermal_cooling_rate: Cooling rate towards ambient per time step.
+        :param thermal_heating_factor: Factor for temperature rise due to current flow.
         """
+
+        # Battery parameters
         self.initial_capacity = capacity_ah
         self.capacity = capacity_ah
         self.charge_rate = charge_rate_a
         self.discharge_rate = discharge_rate_a
-        self.charge_eff = charge_efficiency
-        self.discharge_eff = discharge_efficiency
+        self.charge_eff_base = charge_efficiency
+        self.discharge_eff_base = discharge_efficiency
         self.degradation_rate = degradation_rate
-        
         self.num_cells_series = num_cells_series
-        self.v_min_cell = 3.0   # minimum voltage per cell at 0% SoC
-        self.v_max_cell = 4.2   # maximum voltage per cell at 100% SoC
 
-        # State of Charge in percentage
+        # Voltage parameters
+        self.v_min_cell = 3.0   
+        self.v_max_cell = 4.2   
+
+        # State
         self.soc = 100
-        # Track the number of completed full cycles
         self.cycles = 0
-        # Time steps
         self.time = 0
-        
-        # Flag to detect full cycles (0%->100%->0% or 100%->0%->100%)
+
+        # Temperature parameters
+        self.temperature = initial_temperature
+        self.ambient_temperature = ambient_temperature
+        self.thermal_cooling_rate = thermal_cooling_rate
+        self.thermal_heating_factor = thermal_heating_factor
+
+        # Cycle tracking
         self.last_full_charge_reached = True
-        
-        self.history = {'time': [], 'SoC': [], 'Capacity': [], 'Cycles': [], 'Voltage': []}
-        
-        # Log initial state
+
+        # Data history
+        self.history = {'time': [], 'SoC': [], 'Capacity': [], 'Cycles': [], 'Voltage': [], 'Temperature': []}
+
         self.log_state()
 
     def get_voltage_from_soc(self, soc):
-        """
-        Estimate pack voltage from SoC using a simple linear approximation.
-        Vpack(SOC) = Vmin_pack + (SOC/100)*(Vmax_pack - Vmin_pack)
-        where:
-        Vmax_pack = num_cells_series * v_max_cell
-        Vmin_pack = num_cells_series * v_min_cell
-        """
+        """Linear approximation of voltage from SoC."""
         v_min_pack = self.num_cells_series * self.v_min_cell
         v_max_pack = self.num_cells_series * self.v_max_cell
         voltage = v_min_pack + (soc / 100.0) * (v_max_pack - v_min_pack)
         return voltage
 
-    def log_state(self):
-        """Logs current state to history."""
-        self.history['time'].append(self.time)
-        self.history['SoC'].append(self.soc)
-        self.history['Capacity'].append(self.capacity)
-        self.history['Cycles'].append(self.cycles)
-        # Calculate and log voltage
-        self.history['Voltage'].append(self.get_voltage_from_soc(self.soc))
-
     def effective_charge_rate(self):
         """
-        Returns an effective charge rate based on SoC.
-        Reduce charge rate linearly above 80% SoC.
+        Reduce charge rate near full capacity.
         """
         if self.soc >= 80:
             reduction_factor = 1.0 - 0.9 * ((self.soc - 80) / 20)
@@ -87,8 +82,7 @@ class BatterySimulator:
 
     def effective_discharge_rate(self):
         """
-        Returns an effective discharge rate based on SoC.
-        Reduce discharge rate linearly below 20% SoC.
+        Reduce discharge rate near empty capacity.
         """
         if self.soc <= 20:
             reduction_factor = 1.0 - 0.9 * ((20 - self.soc) / 20)
@@ -96,100 +90,169 @@ class BatterySimulator:
         else:
             return self.discharge_rate
 
+    def temperature_adjusted_efficiencies(self):
+        """
+        Adjust charge and discharge efficiencies based on temperature.
+        As a simplistic model:
+        - At low temperatures (<10°C), efficiency decreases by up to 10%.
+        - At high temperatures (>40°C), efficiency also decreases by up to 10%.
+        Between 10°C and 40°C, the nominal efficiency is retained.
+
+        Similarly, capacity can be affected by temperature:
+        - At low temperature (<10°C), reduce usable capacity by 5%.
+        - At high temperature (>40°C), reduce usable capacity by 5%.
+        """
+        charge_eff = self.charge_eff_base
+        discharge_eff = self.discharge_eff_base
+        capacity_factor = 1.0
+
+        if self.temperature < 10:
+            # Cold reduces efficiency and capacity
+            charge_eff *= 0.9
+            discharge_eff *= 0.9
+            capacity_factor = 0.95
+        elif self.temperature > 40:
+            # Hot reduces efficiency and capacity
+            charge_eff *= 0.9
+            discharge_eff *= 0.9
+            capacity_factor = 0.95
+
+        return charge_eff, discharge_eff, capacity_factor
+
     def charge(self, time_hours):
-        """Simulates charging the battery for a given number of hours."""
+        """Simulates battery charging."""
         eff_rate = self.effective_charge_rate()
-        energy_added = eff_rate * time_hours * self.charge_eff  # Ah added
-        new_soc = self.soc + (energy_added / self.capacity * 100)
-        if new_soc > 100:
-            new_soc = 100
+        charge_eff, _, capacity_factor = self.temperature_adjusted_efficiencies()
+
+        # Adjust the effective capacity based on temperature
+        effective_capacity = self.capacity * capacity_factor
+
+        energy_added = eff_rate * time_hours * charge_eff
+        new_soc = self.soc + (energy_added / effective_capacity * 100)
+        new_soc = min(new_soc, 100)
         self.update_soc(new_soc)
+
+        # Heating effect from charging
+        self.heat_dissipation(charge_current=eff_rate, discharge_current=0, time_hours=time_hours)
 
         if self.soc == 100:
             self.last_full_charge_reached = True
 
     def discharge(self, time_hours):
-        """Simulates discharging the battery for a given number of hours."""
+        """Simulates battery discharging."""
         eff_rate = self.effective_discharge_rate()
-        energy_removed = eff_rate * time_hours / self.discharge_eff  # Ah removed
-        new_soc = self.soc - (energy_removed / self.capacity * 100)
-        if new_soc < 0:
-            new_soc = 0
+        _, discharge_eff, capacity_factor = self.temperature_adjusted_efficiencies()
+
+        # Adjust the effective capacity based on temperature
+        effective_capacity = self.capacity * capacity_factor
+
+        energy_removed = eff_rate * time_hours / discharge_eff
+        new_soc = self.soc - (energy_removed / effective_capacity * 100)
+        new_soc = max(new_soc, 0)
         old_soc = self.soc
         self.update_soc(new_soc)
 
-        # If we reach 0% and we had previously been fully charged, that completes a full cycle
+        # Heating effect from discharging
+        self.heat_dissipation(charge_current=0, discharge_current=eff_rate, time_hours=time_hours)
+
+        # Full cycle detection
         if self.soc == 0 and self.last_full_charge_reached:
             self.cycles += 1
             self.last_full_charge_reached = False
-            # Apply capacity degradation per full cycle
+            # Degrade capacity after full cycle
             self.capacity -= self.degradation_rate * self.initial_capacity
             if self.capacity < 0:
                 self.capacity = 0
 
+    def heat_dissipation(self, charge_current, discharge_current, time_hours):
+        """
+        A simple temperature model:
+        - Heat generated is proportional to current * time.
+        - Battery then cools towards ambient at a fixed rate.
+        """
+        # Heating proportional to total current flow
+        total_current = charge_current + discharge_current
+        heat_generated = self.thermal_heating_factor * total_current * time_hours
+        self.temperature += heat_generated
+
+        # Cooling towards ambient
+        # The closer the battery is to ambient, the less it cools.
+        temp_diff = self.temperature - self.ambient_temperature
+        if abs(temp_diff) > 0.01:
+            # Move temperature a fraction closer to ambient
+            self.temperature -= np.sign(temp_diff) * min(abs(temp_diff), self.thermal_cooling_rate)
+
     def update_soc(self, new_soc):
         """
-        Updates the State of Charge and time, and logs the state.
+        Updates SOC, time, and logs the state.
         """
         self.soc = max(min(new_soc, 100), 0)
         self.time += 1
         self.log_state()
 
+    def log_state(self):
+        """Logs current state to history."""
+        self.history['time'].append(self.time)
+        self.history['SoC'].append(self.soc)
+        self.history['Capacity'].append(self.capacity)
+        self.history['Cycles'].append(self.cycles)
+        self.history['Voltage'].append(self.get_voltage_from_soc(self.soc))
+        self.history['Temperature'].append(self.temperature)
+
     def simulate(self, steps, charge_time=1.0, discharge_time=1.0):
         """
-        Simulates a series of charge/discharge cycles.
-        
-        :param steps: Number of steps.
-        :param charge_time: Duration of each charging period (hours).
-        :param discharge_time: Duration of each discharging period (hours).
+        Simulates charge/discharge steps.
         """
         for _ in range(steps):
             self.charge(charge_time)
             self.discharge(discharge_time)
 
     def plot_results(self):
-        """Plots the State of Charge, Capacity, and Voltage over time."""
-        fig, axs = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+        """Plot SoC, Capacity, Voltage, and Temperature."""
+        fig, axs = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
 
-        # Plot SoC
+        # SoC
         axs[0].plot(self.history['time'], self.history['SoC'], color='tab:blue')
         axs[0].set_ylabel('SoC (%)')
         axs[0].grid(True)
 
-        # Plot Capacity
+        # Capacity
         axs[1].plot(self.history['time'], self.history['Capacity'], color='tab:red')
         axs[1].set_ylabel('Capacity (Ah)')
         axs[1].grid(True)
 
-        # Plot Voltage
+        # Voltage
         axs[2].plot(self.history['time'], self.history['Voltage'], color='tab:green')
         axs[2].set_ylabel('Voltage (V)')
-        axs[2].set_xlabel('Time Steps')
         axs[2].grid(True)
 
-        plt.suptitle('Battery Simulation (SoC, Capacity, Voltage)')
+        # Temperature
+        axs[3].plot(self.history['time'], self.history['Temperature'], color='tab:orange')
+        axs[3].set_ylabel('Temperature (°C)')
+        axs[3].set_xlabel('Time Steps')
+        axs[3].grid(True)
+
+        plt.suptitle('Battery Simulation (SoC, Capacity, Voltage, Temperature)')
         plt.tight_layout()
         plt.show()
 
 
 # Example usage:
 if __name__ == "__main__":
-    # Realistic battery scenario:
-    #  - Initial capacity = 100 Ah
-    #  - Charge/Discharge rate = 10 A nominal
-    #  - Charge & discharge efficiency = 95%
-    #  - Slight capacity degradation per cycle
-    #  - 13 cells in series, giving a voltage range from ~39 V (empty) to ~54.6 V (full)
-    battery = BatterySimulator(capacity_ah=100, 
-                               charge_rate_a=10, 
-                               discharge_rate_a=10, 
-                               charge_efficiency=0.95, 
-                               discharge_efficiency=0.95, 
-                               degradation_rate=0.0005,
-                               num_cells_series=13)
-    
-    # Simulate 500 steps, each step: 0.5h charge, then 0.5h discharge
-    battery.simulate(steps=10000, charge_time=0.5, discharge_time=0.5)
-    
-    # Plot results (SoC, Capacity, and Voltage)
+    battery = BatterySimulator(
+        capacity_ah=100,
+        charge_rate_a=10,
+        discharge_rate_a=10,
+        charge_efficiency=0.95,
+        discharge_efficiency=0.95,
+        degradation_rate=0.0005,
+        num_cells_series=13,
+        initial_temperature=25.0,
+        ambient_temperature=25.0,
+        thermal_cooling_rate=0.05,    # slower cooling
+        thermal_heating_factor=0.1    # more heat per current flow
+    )
+
+    # Simulate 100 steps with 0.5h charge and 0.5h discharge
+    battery.simulate(steps=100, charge_time=0.5, discharge_time=0.5)
     battery.plot_results()
